@@ -1,0 +1,8 @@
+[package]
+name = "emv-term"
+version = "0.1.0"
+authors = ["Q Misell <q@misell.cymru>"]
+edition = "2018"
+
+[dependencies]
+pcsc="^2.1"
