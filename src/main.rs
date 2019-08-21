@@ -31,7 +31,7 @@ impl fmt::Debug for ApduResponse {
     }
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Copy, Clone)]
 enum TagID {
     IssuerIdentificationNumber,
     ApplicationDedicatedFileName,
@@ -92,7 +92,7 @@ impl From<u32> for TagID {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum TagContents {
     Invalid,
     String(String),
@@ -110,12 +110,13 @@ impl TagContents {
                     Err(_) => TagContents::Invalid,
                 }
             }
-            TagID::ShortFileIdentifier => TagContents::Byte(bytes[0]),
+            TagID::ShortFileIdentifier | TagID::ApplicationPriorityIndicator => TagContents::Byte(bytes[0]),
             _ => TagContents::Bytes(bytes.to_vec())
         }
     }
 }
 
+#[derive(Clone)]
 struct Tag {
     id: TagID,
     contents: TagContents,
@@ -127,6 +128,13 @@ impl Tag {
         match &self.contents {
             TagContents::Constructed(tl) => tl.get_tag(tag_id),
             _ => None
+        }
+    }
+
+    fn get_tags(&self, tag_id: TagID) -> Vec<Tag> {
+        match &self.contents {
+            TagContents::Constructed(tl) => tl.get_tags(tag_id),
+            _ => vec![]
         }
     }
 }
@@ -145,7 +153,7 @@ impl fmt::Debug for Tag {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct TagList {
     tags: Vec<Tag>
 }
@@ -158,6 +166,16 @@ impl TagList {
             }
         }
         None
+    }
+
+    fn get_tags(&self, tag_id: TagID) -> Vec<Tag> {
+        let mut tags: Vec<Tag> = vec![];
+        for tag in &self.tags {
+            if tag.id == tag_id {
+                tags.push(tag.clone())
+            }
+        }
+        tags
     }
 }
 
@@ -262,6 +280,27 @@ impl TryFrom<&VecDeque<u8>> for TagList {
         }
 
         Ok(out)
+    }
+}
+
+#[derive(Debug)]
+struct ApplicationPriorityIndicator {
+    auto_selection_allowed: bool,
+    priority: u8,
+}
+
+impl From<&Tag> for ApplicationPriorityIndicator {
+    fn from(value: &Tag) -> Self {
+        let contents = match value.contents {
+            TagContents::Byte(b) => b,
+            _ => unreachable!()
+        };
+        let auto_selection_allowed = contents & 0b10000000 == 0;
+        let priority = contents & 0b1111;
+        Self {
+            auto_selection_allowed,
+            priority
+        }
     }
 }
 
@@ -370,7 +409,7 @@ fn find_reader(ctx: &pcsc::Context) -> Result<CString, pcsc::Error> {
     }
 }
 
-fn card_read_record(card: &pcsc::Card, record_number: u8, short_file_identifier: u8) -> Result<TagList, pcsc::Error> {
+fn card_read_record(card: &pcsc::Card, short_file_identifier: u8, record_number: u8) -> Result<TagList, pcsc::Error> {
     let apdu_cmd = ApduCommand {
         class: 0x00,
         instruction: 0xb2,
@@ -406,6 +445,75 @@ fn card_select(card: &pcsc::Card, file_name: &str, next: bool) -> Result<TagList
     Ok(tag_list)
 }
 
+fn compare_slice<T: PartialEq>(p1: &[T], p2: &[T]) -> bool {
+    if p1.len() != p1.len() {
+        return false;
+    }
+    let mut i = 0;
+    for v1 in p1 {
+        if &p2[i] != v1 {
+            return false;
+        }
+        i+= 1;
+    }
+    true
+}
+
+fn get_pse_sfi(card: &pcsc::Card) -> Option<u8> {
+    let select_resp = match card_select(&card, "1PAY.SYS.DDF01", false) {
+        Ok(r) => r,
+        Err(_) => return None
+    };
+    let fci = select_resp.get_tag(TagID::FileControlInformationTemplate)?;
+    let fcipt = fci.get_tag(TagID::FileControlInformationProprietaryTemplate)?;
+    match fcipt.get_tag(TagID::ShortFileIdentifier)?.contents {
+        TagContents::Byte(b) => Some(b),
+        _ => unreachable!()
+    }
+}
+
+fn find_possible_applications(card: &pcsc::Card, sfi: u8) -> Vec<Tag> {
+    let acceptable_adf_names = [
+        [0xa0, 0x00, 0x00, 0x00, 0x04, 0x10, 0x10], // Mastercard
+        [0xa0, 0x00, 0x00, 0x00, 0x03, 0x10, 0x10] // Visa
+    ];
+    let mut possible_applications = vec![];
+
+    let mut i = 1;
+    loop {
+        let record_result = card_read_record(&card, sfi, i);
+        match record_result {
+            Ok(r) => {
+                let record = match r.get_tag(TagID::ReadRecordResponseMessageTemplate) {
+                    Some(r) => r,
+                    None => continue
+                };
+                let applications = record.get_tags(TagID::ApplicationTemplate);
+
+                'applications: for application in applications {
+                    let adf_name = match &match application.get_tag(TagID::ApplicationDedicatedFileName) {
+                        Some(n) => n,
+                        None => continue
+                    }.contents {
+                        TagContents::Bytes(a) => a,
+                        _ => unreachable!()
+                    };
+                    for acceptable_name in &acceptable_adf_names {
+                        if compare_slice(acceptable_name, &adf_name) {
+                            possible_applications.push(application);
+                            continue 'applications;
+                        }
+                    }
+                }
+            },
+            Err(_) => break
+        }
+        i += 1;
+    }
+
+    possible_applications
+}
+
 fn main() {
     let ctx = match pcsc::Context::establish(pcsc::Scope::User) {
         Ok(c) => c,
@@ -418,24 +526,16 @@ fn main() {
     let reader = find_reader(&ctx).expect("Unable to find card");
     let card = ctx.connect(&reader, pcsc::ShareMode::Exclusive, pcsc::Protocols::ANY).expect("Unable to connect to card");
 
-    let select_resp = card_select(&card, "1PAY.SYS.DDF01", false).expect("Unable to read PSE");
-    let fci = select_resp.get_tag(TagID::FileControlInformationTemplate).expect("No FCI");
+    let sfi = get_pse_sfi(&card).expect("Unable to read PSE");
+    let possible_applications = find_possible_applications(&card, sfi);
 
-    println!("{:?}", fci);
-
-    let fcipt = fci.get_tag(TagID::FileControlInformationProprietaryTemplate).expect("No FCIPT");
-    let sfi = match fcipt.get_tag(TagID::ShortFileIdentifier).expect("No SFI").contents {
-        TagContents::Byte(b) => b,
-        _ => panic!("SFI not byte")
-    };
-
-    let mut i = 1;
-    loop {
-        let record = card_read_record(&card, i, sfi);
-        match record {
-            Ok(r) => println!("{:?}", r),
-            Err(_) => break
-        }
-        i += 1;
+    if possible_applications.len() == 0 {
+        panic!("No possible applications found");
+    } else if possible_applications.len() == 1 {
+        let application = &possible_applications[0];
+        let priority = ApplicationPriorityIndicator::from(application.get_tag(TagID::ApplicationPriorityIndicator).expect("No API"));
+        println!("{:?}", priority);
     }
+
+    println!("{:?}", possible_applications);
 }
