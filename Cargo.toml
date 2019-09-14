@@ -6,3 +6,4 @@ edition = "2018"
 
 [dependencies]
 pcsc="^2.1"
+encoding="^0.2"
